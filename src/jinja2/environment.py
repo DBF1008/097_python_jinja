@@ -2,6 +2,7 @@
 options.
 """
 
+import json
 import os
 import typing
 import typing as t
@@ -11,6 +12,7 @@ from contextlib import aclosing
 from functools import lru_cache
 from functools import partial
 from functools import reduce
+from hashlib import sha1
 from types import CodeType
 
 from markupsafe import Markup
@@ -78,6 +80,23 @@ def get_spontaneous_environment(cls: type[_env_bound], *args: t.Any) -> _env_bou
     env = cls(*args)
     env.shared = True
     return env
+
+
+def _manifest_source_checksum(source: str) -> str:
+    """Compute a source checksum aligned with
+    :meth:`BytecodeCache.get_source_checksum`.
+    """
+    return sha1(source.encode("utf-8")).hexdigest()
+
+
+def _manifest_cache_key(name: str, filename: str | None = None) -> str:
+    """Compute a cache key aligned with
+    :meth:`BytecodeCache.get_cache_key`.
+    """
+    hash = sha1(name.encode("utf-8"))
+    if filename is not None:
+        hash.update(f"|{filename}".encode())
+    return hash.hexdigest()
 
 
 def create_cache(
@@ -822,6 +841,7 @@ class Environment:
         zip: str | None = "deflated",
         log_function: t.Callable[[str], None] | None = None,
         ignore_errors: bool = True,
+        manifest: str | bool | None = None,
     ) -> None:
         """Finds all the templates the loader can find, compiles them
         and stores them in `target`.  If `zip` is `None`, instead of in a
@@ -838,9 +858,22 @@ class Environment:
         syntax errors to abort the compilation you can set `ignore_errors`
         to `False` and you will get an exception on syntax errors.
 
+        If `manifest` is set, a JSON manifest file is written alongside the
+        compiled templates.  It can be a string giving the filename, or
+        ``True`` to use the default name ``"manifest.json"``.  The manifest
+        contains for each template its name, compiled module name, source
+        checksum, bytecode cache key, and static dependency list — suitable
+        for differential deployment and cache warming in multi-instance
+        setups.  The checksum and cache key use the same algorithm as
+        :class:`~jinja2.bccache.BytecodeCache`.
+
+        .. versionchanged:: 3.2
+            Added the `manifest` parameter.
+
         .. versionadded:: 2.4
         """
         from .loaders import ModuleLoader
+        from .meta import find_referenced_templates
 
         if log_function is None:
 
@@ -874,6 +907,10 @@ class Environment:
                 os.makedirs(target)
             log_function(f"Compiling into folder {target!r}")
 
+        manifest_entries: list[dict[str, t.Any]] | None = None
+        if manifest:
+            manifest_entries = []
+
         try:
             for name in self.list_templates(extensions, filter_func):
                 source, filename, _ = self.loader.get_source(self, name)
@@ -885,15 +922,158 @@ class Environment:
                     log_function(f'Could not compile "{name}": {e}')
                     continue
 
-                filename = ModuleLoader.get_module_filename(name)
+                module_filename = ModuleLoader.get_module_filename(name)
 
-                write_file(filename, code)
-                log_function(f'Compiled "{name}" as {filename}')
+                write_file(module_filename, code)
+                log_function(f'Compiled "{name}" as {module_filename}')
+
+                if manifest_entries is not None:
+                    # Parse again for dependency extraction.  The compile
+                    # call above already parsed internally, but the AST
+                    # is not returned, so we re-parse here — cheap
+                    # compared to compilation.
+                    ast = self._parse(source, name, filename)
+                    deps = [
+                        d
+                        for d in find_referenced_templates(ast)
+                        if d is not None
+                    ]
+                    manifest_entries.append(
+                        {
+                            "name": name,
+                            "module_name": module_filename,
+                            "source_checksum": _manifest_source_checksum(source),
+                            "cache_key": _manifest_cache_key(name, filename),
+                            "dependencies": deps,
+                        }
+                    )
         finally:
             if zip:
                 zip_file.close()
 
+        if manifest_entries is not None:
+            manifest_filename = (
+                manifest if isinstance(manifest, str) else "manifest.json"
+            )
+            manifest_data = self._build_manifest_dict(manifest_entries)
+            manifest_json = json.dumps(manifest_data, indent=2, sort_keys=False)
+            if zip is not None:
+                from zipfile import ZipFile
+                from zipfile import ZipInfo
+
+                # Re-open in append mode to add the manifest.
+                with ZipFile(target, "a") as zf:
+                    info = ZipInfo(manifest_filename)
+                    info.external_attr = 0o644 << 16
+                    zf.writestr(info, manifest_json)
+            else:
+                with open(
+                    os.path.join(target, manifest_filename), "w", encoding="utf-8"
+                ) as f:
+                    f.write(manifest_json)
+            log_function(f"Wrote manifest {manifest_filename!r}")
+
         log_function("Finished compiling templates")
+
+    def _build_manifest_dict(
+        self, entries: list[dict[str, t.Any]]
+    ) -> dict[str, t.Any]:
+        """Build the top-level manifest dictionary."""
+        from .bccache import bc_version
+
+        return {
+            "version": 1,
+            "bc_version": bc_version,
+            "templates": entries,
+        }
+
+    def generate_manifest(
+        self,
+        extensions: t.Collection[str] | None = None,
+        filter_func: t.Callable[[str], bool] | None = None,
+        ignore_errors: bool = True,
+    ) -> dict[str, t.Any]:
+        """Generate a compilation manifest without writing compiled
+        template files.  The manifest is a dictionary containing
+        metadata for every template the loader can find, suitable for
+        differential deployment and cache warming in multi-instance
+        setups.
+
+        The returned dictionary has the following structure:
+
+        .. code-block:: python
+
+            {
+                "version": 1,
+                "bc_version": 5,
+                "templates": [
+                    {
+                        "name": "index.html",
+                        "module_name": "tmpl_<sha1>.py",
+                        "source_checksum": "<sha1>",
+                        "cache_key": "<sha1>",
+                        "dependencies": ["layout.html"]
+                    },
+                    ...
+                ]
+            }
+
+        ``source_checksum`` and ``cache_key`` are computed using the same
+        algorithm as :class:`~jinja2.bccache.BytecodeCache`, so they can
+        be used directly as cache keys.
+
+        ``dependencies`` lists the static template references found by
+        :func:`~jinja2.meta.find_referenced_templates`.  Dynamic
+        references (``{% include var %}``) are omitted.
+
+        `extensions` and `filter_func` are passed to :meth:`list_templates`.
+
+        If `ignore_errors` is ``True`` (the default), templates with
+        syntax errors are silently skipped.  If ``False``,
+        :exc:`~jinja2.exceptions.TemplateSyntaxError` is raised for the
+        first template that fails to parse.
+
+        Example usage::
+
+            env = Environment(loader=FileSystemLoader("templates"))
+            manifest = env.generate_manifest()
+            # Use manifest for differential deployment
+            for entry in manifest["templates"]:
+                if entry["source_checksum"] != deployed[entry["name"]]:
+                    redeploy(entry)
+
+        .. versionadded:: 3.2
+        """
+        from .loaders import ModuleLoader
+        from .meta import find_referenced_templates
+
+        assert self.loader is not None, "No loader configured."
+
+        entries: list[dict[str, t.Any]] = []
+
+        for name in self.list_templates(extensions, filter_func):
+            source, filename, _ = self.loader.get_source(self, name)
+            try:
+                ast = self._parse(source, name, filename)
+            except TemplateSyntaxError:
+                if not ignore_errors:
+                    raise
+                continue
+
+            deps = [
+                d for d in find_referenced_templates(ast) if d is not None
+            ]
+            entries.append(
+                {
+                    "name": name,
+                    "module_name": ModuleLoader.get_module_filename(name),
+                    "source_checksum": _manifest_source_checksum(source),
+                    "cache_key": _manifest_cache_key(name, filename),
+                    "dependencies": deps,
+                }
+            )
+
+        return self._build_manifest_dict(entries)
 
     def list_templates(
         self,
