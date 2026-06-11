@@ -3,6 +3,8 @@ import typing as t
 from functools import WRAPPER_ASSIGNMENTS
 from functools import wraps
 
+from markupsafe import Markup
+
 from .utils import _PassArg
 from .utils import pass_eval_context
 
@@ -56,7 +58,7 @@ def async_variant(normal_func):  # type: ignore
     return decorator
 
 
-_common_primitives = {int, float, bool, str, list, dict, tuple, type(None)}
+_common_primitives = {int, float, bool, str, Markup, list, dict, tuple, type(None)}
 
 
 async def auto_await(value: t.Union[t.Awaitable["V"], "V"]) -> "V":
