@@ -683,3 +683,32 @@ class ModuleLoader(BaseLoader):
         return environment.template_class.from_module_dict(
             environment, mod.__dict__, globals
         )
+
+    def get_dependency_meta(self, name: str) -> list[dict[str, t.Any]]:
+        """Return the embedded dependency metadata for a precompiled template.
+
+        This loads the compiled module without rendering it and reads
+        the ``_jinja_dependency_meta`` variable that was embedded during
+        compilation.
+
+        :param name: The template name.
+        :returns: A list of dependency metadata dicts, or an empty list
+            if the template is not found or has no embedded metadata.
+
+        .. versionadded:: 3.2
+        """
+        key = self.get_template_key(name)
+        module = f"{self.package_name}.{key}"
+        mod = getattr(self.module, module, None)
+
+        if mod is None:
+            try:
+                mod = __import__(module, None, None, ["root"])
+            except ImportError:
+                return []
+
+            # remove the entry from sys.modules, we only want the attribute
+            # on the module object we have stored on the loader.
+            sys.modules.pop(module, None)
+
+        return mod.__dict__.get("_jinja_dependency_meta", [])

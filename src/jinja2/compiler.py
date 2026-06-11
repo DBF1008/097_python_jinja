@@ -942,6 +942,16 @@ class CodeGenerator(NodeVisitor):
         debug_kv_str = "&".join(f"{k}={v}" for k, v in self.debug_info)
         self.writeline(f"debug_info = {debug_kv_str!r}")
 
+        # Embed structured dependency metadata for static analysis.
+        # This has no impact on rendering — it's a plain data literal
+        # that can be read from precompiled modules.
+        from .dependency import _dependency_to_meta_dict
+        from .dependency import extract_dependencies
+
+        dep_list = extract_dependencies(node, self.name or "<unknown>")
+        meta_repr = repr([_dependency_to_meta_dict(d) for d in dep_list])
+        self.writeline(f"_jinja_dependency_meta = {meta_repr}", extra=1)
+
     def visit_Block(self, node: nodes.Block, frame: Frame) -> None:
         """Call a block and register it for the template."""
         level = 0

@@ -1129,6 +1129,53 @@ class Environment:
 
         return ChainMap(d, self.globals)
 
+    def get_template_dependencies(
+        self, template_name: str
+    ) -> list["t.Any"]:
+        """Return the direct structured dependencies of a single template.
+
+        This parses the template's AST without executing it and extracts
+        typed dependency information (extends, include, import,
+        from-import).
+
+        :param template_name: The name of the template to analyze.
+        :returns: A list of :class:`~jinja2.dependency.Dependency`
+            instances.
+
+        .. versionadded:: 3.2
+        """
+        from .dependency import Dependency
+        from .dependency import extract_dependencies
+
+        if self.loader is None:
+            raise TypeError("no loader configured on the environment")
+
+        source, filename, _ = self.loader.get_source(self, template_name)
+        ast = self.parse(source, template_name, filename)
+        return extract_dependencies(ast, template_name)
+
+    def get_dependency_graph(
+        self,
+        root_templates: t.Iterable[str] | None = None,
+    ) -> "t.Any":
+        """Build a complete dependency graph by traversing templates.
+
+        Starting from the given root templates (or all templates if
+        ``root_templates`` is ``None``), this function parses each
+        template and follows dependency references recursively.
+        Circular dependencies are automatically detected.
+
+        :param root_templates: Starting template names. If ``None``,
+            all templates from :meth:`list_templates` are used.
+        :returns: A :class:`~jinja2.dependency.DependencyGraph` with
+            cycle detection applied.
+
+        .. versionadded:: 3.2
+        """
+        from .dependency import build_dependency_graph
+
+        return build_dependency_graph(self, root_templates)
+
 
 class Template:
     """A compiled template that can be rendered.
