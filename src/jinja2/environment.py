@@ -2,6 +2,7 @@
 options.
 """
 
+import json
 import os
 import typing
 import typing as t
@@ -11,6 +12,7 @@ from contextlib import aclosing
 from functools import lru_cache
 from functools import partial
 from functools import reduce
+from hashlib import sha1
 from types import CodeType
 
 from markupsafe import Markup
@@ -894,6 +896,118 @@ class Environment:
                 zip_file.close()
 
         log_function("Finished compiling templates")
+
+    def generate_manifest(
+        self,
+        target: t.Union[str, "os.PathLike[str]"],
+        extensions: t.Collection[str] | None = None,
+        filter_func: t.Callable[[str], bool] | None = None,
+        zip: str | None = "deflated",
+        log_function: t.Callable[[str], None] | None = None,
+        ignore_errors: bool = True,
+    ) -> dict[str, t.Any]:
+        """Generate a manifest of compiled template metadata without
+        performing full compilation.  The manifest contains template
+        names, compiled module filenames, source checksums (aligned with
+        :class:`~jinja2.bccache.BytecodeCache` key rules), and
+        dependency information.
+
+        The manifest is written as ``manifest.json`` into the *target*
+        directory or zip file and also returned as a dict.
+
+        `extensions` and `filter_func` are passed to :meth:`list_templates`.
+
+        If `ignore_errors` is ``True`` (default), templates with syntax
+        errors are recorded in the ``errors`` list.  Set to ``False`` to
+        let :exc:`TemplateSyntaxError` propagate.
+
+        .. versionadded:: 3.2
+        """
+        from . import meta
+        from .loaders import ModuleLoader
+
+        if log_function is None:
+
+            def log_function(x: str) -> None:
+                pass
+
+        assert log_function is not None
+        assert self.loader is not None, "No loader configured."
+
+        entries: list[dict[str, t.Any]] = []
+        errors: list[dict[str, str]] = []
+
+        for name in self.list_templates(extensions, filter_func):
+            source, filename, _ = self.loader.get_source(self, name)
+
+            try:
+                ast = self._parse(source, name, filename)
+            except TemplateSyntaxError as e:
+                if not ignore_errors:
+                    raise
+                log_function(f'Could not parse "{name}": {e}')
+                errors.append({"name": name, "error": str(e)})
+                continue
+
+            hash = sha1(name.encode("utf-8"))
+            if filename is not None:
+                hash.update(f"|{filename}".encode())
+            cache_key = hash.hexdigest()
+
+            source_checksum = sha1(source.encode("utf-8")).hexdigest()
+
+            deps_raw = list(meta.find_referenced_templates(ast))
+            has_dynamic = None in deps_raw
+            deps: list[str | None] = sorted(
+                d for d in deps_raw if d is not None
+            )
+            if has_dynamic:
+                deps.append(None)
+
+            entries.append(
+                {
+                    "name": name,
+                    "module": ModuleLoader.get_module_filename(name),
+                    "cache_key": cache_key,
+                    "source_checksum": source_checksum,
+                    "dependencies": deps,
+                }
+            )
+            log_function(f'Processed "{name}"')
+
+        manifest: dict[str, t.Any] = {
+            "version": 1,
+            "templates": entries,
+            "errors": errors,
+        }
+
+        manifest_data = json.dumps(manifest, indent=2, sort_keys=False)
+
+        if zip is not None:
+            from zipfile import ZIP_DEFLATED
+            from zipfile import ZIP_STORED
+            from zipfile import ZipFile
+            from zipfile import ZipInfo
+
+            with ZipFile(
+                target,
+                "w",
+                dict(deflated=ZIP_DEFLATED, stored=ZIP_STORED)[zip],
+            ) as zip_file:
+                info = ZipInfo("manifest.json")
+                info.external_attr = 0o755 << 16
+                zip_file.writestr(info, manifest_data)
+            log_function(f"Wrote manifest into Zip archive {target!r}")
+        else:
+            if not os.path.isdir(target):
+                os.makedirs(target)
+            with open(
+                os.path.join(target, "manifest.json"), "w", encoding="utf-8"
+            ) as f:
+                f.write(manifest_data)
+            log_function(f"Wrote manifest into folder {target!r}")
+
+        return manifest
 
     def list_templates(
         self,
