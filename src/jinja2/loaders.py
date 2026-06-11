@@ -72,6 +72,15 @@ class BaseLoader:
     #: .. versionadded:: 2.4
     has_source_access = True
 
+    @property
+    def cache_key(self) -> str:
+        """A string that identifies this loader type and configuration
+        for bytecode cache key generation. Different loaders or different
+        configurations of the same loader type produce different keys to
+        prevent stale bytecode from being reused after a loader switch.
+        """
+        return type(self).__qualname__
+
     def get_source(
         self, environment: "Environment", template: str
     ) -> tuple[str, str | None, t.Callable[[], bool] | None]:
@@ -129,7 +138,9 @@ class BaseLoader:
         # bytecode cache configured.
         bcc = environment.bytecode_cache
         if bcc is not None:
-            bucket = bcc.get_bucket(environment, name, filename, source)
+            bucket = bcc.get_bucket(
+                environment, name, filename, source, self.cache_key
+            )
             code = bucket.code
 
         # if we don't have code so far (not cached, no longer up to
@@ -143,6 +154,13 @@ class BaseLoader:
         if bcc is not None and bucket.code is None:
             bucket.code = code
             bcc.set_bucket(bucket)
+
+        # Correct the filename embedded in the cached code object so
+        # that tracebacks point to the current loader's path, not a
+        # stale path from an old cache entry.
+        expected_filename = filename if filename is not None else "<template>"
+        if code.co_filename != expected_filename:
+            code = code.replace(co_filename=expected_filename)
 
         return environment.template_class.from_code(
             environment, code, globals, uptodate
@@ -190,6 +208,10 @@ class FileSystemLoader(BaseLoader):
         self.searchpath = [os.fspath(p) for p in searchpath]
         self.encoding = encoding
         self.followlinks = followlinks
+
+    @property
+    def cache_key(self) -> str:
+        return f"{type(self).__qualname__}|{'|'.join(self.searchpath)}"
 
     def get_source(
         self, environment: "Environment", template: str
@@ -361,6 +383,12 @@ class PackageLoader(BaseLoader):
                 )
 
         self._template_root = template_root
+
+    @property
+    def cache_key(self) -> str:
+        return (
+            f"{type(self).__qualname__}|{self.package_name}|{self.package_path}"
+        )
 
     def get_source(
         self, environment: "Environment", template: str

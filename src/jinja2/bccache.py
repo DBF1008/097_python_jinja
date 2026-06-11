@@ -147,12 +147,20 @@ class BytecodeCache:
         by a particular environment.
         """
 
-    def get_cache_key(self, name: str, filename: str | None = None) -> str:
+    def get_cache_key(
+        self,
+        name: str,
+        filename: str | None = None,
+        loader_key: str | None = None,
+    ) -> str:
         """Returns the unique hash key for this template name."""
         hash = sha1(name.encode("utf-8"))
 
         if filename is not None:
             hash.update(f"|{filename}".encode())
+
+        if loader_key is not None:
+            hash.update(f"|{loader_key}".encode())
 
         return hash.hexdigest()
 
@@ -166,11 +174,12 @@ class BytecodeCache:
         name: str,
         filename: str | None,
         source: str,
+        loader_key: str | None = None,
     ) -> Bucket:
         """Return a cache bucket for the given template.  All arguments are
         mandatory but filename may be `None`.
         """
-        key = self.get_cache_key(name, filename)
+        key = self.get_cache_key(name, filename, loader_key)
         checksum = self.get_source_checksum(source)
         bucket = Bucket(environment, key, checksum)
         self.load_bytecode(bucket)

@@ -8,6 +8,8 @@ from jinja2 import ChoiceLoader
 from jinja2 import DictLoader
 from jinja2 import Environment
 from jinja2 import TemplateSyntaxError
+from jinja2.bccache import FileSystemBytecodeCache
+from jinja2.loaders import FileSystemLoader
 
 
 @pytest.fixture
@@ -115,3 +117,33 @@ to be closed is 'for'.
     def test_get_corresponding_lineno_traceback(self, fs_env):
         tmpl = fs_env.get_template("test.html")
         assert tmpl.get_corresponding_lineno(1) == 1
+
+    def test_traceback_correct_after_bytecode_cache(self, tmp_path):
+        tmpl_dir = tmp_path / "templates"
+        tmpl_dir.mkdir()
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        (tmpl_dir / "err.html").write_text("Before\n{{ fail() }}\nAfter")
+
+        bcc = FileSystemBytecodeCache(str(cache_dir))
+        loader = FileSystemLoader(str(tmpl_dir))
+        env = Environment(loader=loader, bytecode_cache=bcc)
+
+        # First load compiles and caches the bytecode.
+        env.get_template("err.html")
+
+        # Clear the in-memory template cache so the next load must go
+        # through the bytecode cache.
+        env.cache.clear()
+
+        tmpl = env.get_template("err.html")
+
+        with pytest.raises(ZeroDivisionError) as exc_info:
+            tmpl.render(fail=lambda: 1 / 0)
+
+        tb_text = "".join(
+            format_exception(exc_info.type, exc_info.value, exc_info.tb)
+        )
+        assert "err.html" in tb_text
+        assert str(tmpl_dir) in tb_text
