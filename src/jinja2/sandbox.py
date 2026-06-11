@@ -5,6 +5,8 @@ Useful when the template itself comes from an untrusted source.
 import operator
 import types
 import typing as t
+from contextvars import ContextVar
+from dataclasses import dataclass
 from _string import formatter_field_name_split  # type: ignore
 from collections import abc
 from collections import deque
@@ -20,6 +22,38 @@ from .runtime import Context
 from .runtime import Undefined
 
 F = t.TypeVar("F", bound=t.Callable[..., t.Any])
+
+_sandbox_context_var: ContextVar[Context | None] = ContextVar(
+    "_sandbox_context_var", default=None
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxViolation:
+    """Describes a sandbox security violation intercepted during rendering.
+
+    Instances are passed to the ``sandbox_audit`` callback and never
+    contain a reference to the real runtime object — only safe
+    string descriptions.
+    """
+
+    kind: str
+    """One of ``"unsafe_attribute"``, ``"unsafe_call"``, or
+    ``"immutable_mutation"``."""
+
+    obj_type: str
+    """``type(obj).__name__`` of the object involved."""
+
+    attr: str | None
+    """The attribute name that was blocked, or the ``__name__`` of the
+    callable for ``unsafe_call`` violations.  ``None`` when unavailable."""
+
+    context_name: str | None
+    """The template-context variable name that resolved to the object,
+    found via identity lookup.  ``None`` when unavailable."""
+
+
+SandboxAuditCallback = t.Callable[[SandboxViolation], None]
 
 #: maximum number of items a range may produce
 MAX_RANGE = 100000
@@ -239,11 +273,49 @@ class SandboxedEnvironment(Environment):
     #: .. versionadded:: 2.6
     intercepted_unops: frozenset[str] = frozenset()
 
-    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+    def __init__(
+        self,
+        *args: t.Any,
+        sandbox_audit: SandboxAuditCallback | None = None,
+        **kwargs: t.Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.globals["range"] = safe_range
         self.binop_table = self.default_binop_table.copy()
         self.unop_table = self.default_unop_table.copy()
+        self.sandbox_audit = sandbox_audit
+
+    def _set_sandbox_context(self, context: Context) -> None:
+        _sandbox_context_var.set(context)
+
+    def _resolve_context_name(self, obj: t.Any) -> str | None:
+        ctx = _sandbox_context_var.get(None)
+        if ctx is None:
+            return None
+        for key, value in ctx.parent.items():
+            if value is obj:
+                return key
+        for key, value in ctx.vars.items():
+            if value is obj:
+                return key
+        return None
+
+    def _emit_audit(
+        self,
+        kind: str,
+        obj: t.Any,
+        attr: str | None,
+    ) -> None:
+        if self.sandbox_audit is None:
+            return
+        self.sandbox_audit(
+            SandboxViolation(
+                kind=kind,
+                obj_type=type(obj).__name__,
+                attr=attr,
+                context_name=self._resolve_context_name(obj),
+            )
+        )
 
     def is_safe_attribute(self, obj: t.Any, attr: str, value: t.Any) -> bool:
         """The sandboxed environment will call this method to check if the
@@ -306,6 +378,13 @@ class SandboxedEnvironment(Environment):
                             return fmt
                         if self.is_safe_attribute(obj, argument, value):
                             return value
+                        self._emit_audit(
+                            "immutable_mutation"
+                            if modifies_known_mutable(obj, argument)
+                            else "unsafe_attribute",
+                            obj,
+                            argument,
+                        )
                         return self.unsafe_undefined(obj, argument)
         return self.undefined(obj=obj, name=argument)
 
@@ -326,6 +405,13 @@ class SandboxedEnvironment(Environment):
                 return fmt
             if self.is_safe_attribute(obj, attribute, value):
                 return value
+            self._emit_audit(
+                "immutable_mutation"
+                if modifies_known_mutable(obj, attribute)
+                else "unsafe_attribute",
+                obj,
+                attribute,
+            )
             return self.unsafe_undefined(obj, attribute)
         return self.undefined(obj=obj, name=attribute)
 
@@ -395,6 +481,11 @@ class SandboxedEnvironment(Environment):
         # the double prefixes are to avoid double keyword argument
         # errors when proxying the call.
         if not __self.is_safe_callable(__obj):
+            __self._emit_audit(
+                "unsafe_call",
+                __obj,
+                getattr(__obj, "__name__", None),
+            )
             raise SecurityError(f"{__obj!r} is not safely callable")
         return __context.call(__obj, *args, **kwargs)
 

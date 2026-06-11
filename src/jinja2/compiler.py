@@ -727,6 +727,8 @@ class CodeGenerator(NodeVisitor):
         # always use the standard Undefined class for the implicit else of
         # conditional expressions
         self.writeline("cond_expr_undefined = Undefined")
+        if self.environment.sandboxed:
+            self.writeline("environment._set_sandbox_context(context)")
         self.writeline("if 0: yield None")
 
     def push_parameter_definitions(self, frame: Frame) -> None:

@@ -8,6 +8,7 @@ from jinja2.exceptions import TemplateSyntaxError
 from jinja2.nodes import EvalContext
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 from jinja2.sandbox import SandboxedEnvironment
+from jinja2.sandbox import SandboxViolation
 from jinja2.sandbox import unsafe
 
 
@@ -200,3 +201,194 @@ class TestStringFormatMap:
 
         with pytest.raises(SecurityError):
             t.render()
+
+
+class TestSandboxAudit:
+    def test_audit_unsafe_attribute(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        t = env.from_string("{{ foo.__class__ }}")
+        result = t.render(foo=42)
+        assert result == ""
+        assert len(events) == 1
+        assert events[0].kind == "unsafe_attribute"
+        assert events[0].obj_type == "int"
+        assert events[0].attr == "__class__"
+        assert events[0].context_name == "foo"
+
+    def test_audit_unsafe_call(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        t = env.from_string("{{ foo.foo() }}")
+        with pytest.raises(SecurityError):
+            t.render(foo=PrivateStuff())
+        assert len(events) == 1
+        assert events[0].kind == "unsafe_call"
+        assert events[0].obj_type == "method"
+        assert events[0].attr == "foo"
+
+    def test_audit_immutable_mutation_list(self):
+        events: list[SandboxViolation] = []
+        env = ImmutableSandboxedEnvironment(sandbox_audit=events.append)
+        with pytest.raises(SecurityError):
+            env.from_string("{{ items.append(23) }}").render(items=[1, 2])
+        assert len(events) >= 1
+        mut_events = [e for e in events if e.kind == "immutable_mutation"]
+        assert len(mut_events) == 1
+        assert mut_events[0].obj_type == "list"
+        assert mut_events[0].attr == "append"
+        assert mut_events[0].context_name == "items"
+
+    def test_audit_immutable_mutation_dict(self):
+        events: list[SandboxViolation] = []
+        env = ImmutableSandboxedEnvironment(sandbox_audit=events.append)
+        with pytest.raises(SecurityError):
+            env.from_string("{{ d.clear() }}").render(d={"a": 1})
+        assert any(
+            e.kind == "immutable_mutation" and e.attr == "clear" and e.obj_type == "dict"
+            for e in events
+        )
+
+    def test_audit_context_name_resolved(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        obj = type("Secret", (), {"__repr__": lambda s: "Secret()"})()
+        t = env.from_string("{{ thing.__class__ }}")
+        t.render(thing=obj)
+        assert len(events) == 1
+        assert events[0].context_name == "thing"
+
+    def test_audit_context_name_none_for_nested(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        inner = {"__class__": "nope"}
+        t = env.from_string("{{ outer.inner.__class__ }}")
+        t.render(outer={"inner": inner})
+        attr_events = [e for e in events if e.kind == "unsafe_attribute"]
+        if attr_events:
+            assert attr_events[0].attr == "__class__"
+
+    def test_no_audit_backward_compatible(self):
+        env = SandboxedEnvironment()
+        assert env.sandbox_audit is None
+        t = env.from_string("{{ foo.__class__ }}")
+        assert t.render(foo=42) == ""
+        pytest.raises(
+            SecurityError,
+            env.from_string("{{ foo.foo() }}").render,
+            foo=PrivateStuff(),
+        )
+
+    def test_no_object_leak(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        secret = type("MySecret", (), {"__repr__": lambda s: "s3cret"})()
+        env.from_string("{{ s.__class__ }}").render(s=secret)
+        assert len(events) == 1
+        v = events[0]
+        assert isinstance(v.obj_type, str)
+        assert isinstance(v.attr, str)
+        assert v.context_name is None or isinstance(v.context_name, str)
+        assert not any(
+            f is secret for f in (v.kind, v.obj_type, v.attr, v.context_name)
+        )
+
+    def test_violation_is_frozen(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        env.from_string("{{ foo.__class__ }}").render(foo=42)
+        with pytest.raises(AttributeError):
+            events[0].kind = "hacked"  # type: ignore[misc]
+
+    def test_audit_via_getitem(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        t = env.from_string('{{ foo["__class__"] }}')
+        t.render(foo=42)
+        attr_events = [e for e in events if e.kind == "unsafe_attribute"]
+        assert len(attr_events) == 1
+        assert attr_events[0].attr == "__class__"
+        assert attr_events[0].obj_type == "int"
+
+    def test_audit_multiple_violations(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        t = env.from_string("{{ a.__class__ }}{{ b.__class__ }}")
+        t.render(a=42, b="hi")
+        assert len(events) == 2
+        types_seen = {e.obj_type for e in events}
+        assert types_seen == {"int", "str"}
+
+    def test_audit_safe_access_no_event(self):
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append)
+        t = env.from_string("{{ foo.bar() }}")
+        result = t.render(foo=PublicStuff())
+        assert result == "23"
+        assert len(events) == 0
+
+
+class TestSandboxAuditAsync:
+    def test_audit_async_unsafe_attribute(self):
+        import asyncio
+
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append, enable_async=True)
+        t = env.from_string("{{ foo.__class__ }}")
+        result = asyncio.run(t.render_async(foo=42))
+        assert result == ""
+        assert len(events) == 1
+        assert events[0].kind == "unsafe_attribute"
+        assert events[0].obj_type == "int"
+        assert events[0].attr == "__class__"
+        assert events[0].context_name == "foo"
+
+    def test_audit_async_unsafe_call(self):
+        import asyncio
+
+        events: list[SandboxViolation] = []
+        env = SandboxedEnvironment(sandbox_audit=events.append, enable_async=True)
+        t = env.from_string("{{ foo.foo() }}")
+        with pytest.raises(SecurityError):
+            asyncio.run(t.render_async(foo=PrivateStuff()))
+        assert len(events) == 1
+        assert events[0].kind == "unsafe_call"
+
+    def test_audit_async_immutable_mutation(self):
+        import asyncio
+
+        events: list[SandboxViolation] = []
+        env = ImmutableSandboxedEnvironment(
+            sandbox_audit=events.append, enable_async=True
+        )
+        with pytest.raises(SecurityError):
+            asyncio.run(
+                env.from_string("{{ items.append(1) }}").render_async(items=[1])
+            )
+        mut_events = [e for e in events if e.kind == "immutable_mutation"]
+        assert len(mut_events) == 1
+        assert mut_events[0].attr == "append"
+
+    def test_audit_async_consistent_with_sync(self):
+        import asyncio
+
+        sync_events: list[SandboxViolation] = []
+        async_events: list[SandboxViolation] = []
+
+        template_str = "{{ x.__class__ }}"
+        ctx = {"x": 42}
+
+        env_sync = SandboxedEnvironment(sandbox_audit=sync_events.append)
+        env_sync.from_string(template_str).render(**ctx)
+
+        env_async = SandboxedEnvironment(
+            sandbox_audit=async_events.append, enable_async=True
+        )
+        asyncio.run(env_async.from_string(template_str).render_async(**ctx))
+
+        assert len(sync_events) == len(async_events)
+        for s, a in zip(sync_events, async_events):
+            assert s.kind == a.kind
+            assert s.obj_type == a.obj_type
+            assert s.attr == a.attr
+            assert s.context_name == a.context_name
