@@ -439,6 +439,18 @@ class Environment:
             if value is not missing:
                 setattr(rv, key, value)
 
+        # Copy mutable namespace dicts to isolate the overlay from the
+        # parent and from sibling overlays.  The shallow __dict__.update
+        # above only copies references; without explicit copies here,
+        # mutating ``overlay.globals["key"] = val`` (or filters / tests /
+        # policies) would leak into every overlay that shares the same
+        # parent -- the root cause of cross-tenant template contamination
+        # in multi-tenant setups that create one overlay per tenant.
+        rv.globals = self.globals.copy()
+        rv.filters = self.filters.copy()
+        rv.tests = self.tests.copy()
+        rv.policies = self.policies.copy()
+
         if cache_size is not missing:
             rv.cache = create_cache(cache_size)
         else:

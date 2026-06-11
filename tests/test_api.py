@@ -433,3 +433,238 @@ def test_overlay_enable_async(env):
     env_async = env.overlay(enable_async=True)
     assert env_async.is_async
     assert not env_async.overlay(enable_async=False).is_async
+
+
+def test_overlay_globals_isolation(env):
+    """Mutating an overlay's globals must not affect the parent or
+    sibling overlays.  This is the root cause of cross-tenant template
+    contamination in multi-tenant setups."""
+    env.globals["shared"] = "parent"
+
+    overlay_a = env.overlay()
+    overlay_b = env.overlay()
+
+    # Overlays start with a copy of the parent globals.
+    assert overlay_a.globals["shared"] == "parent"
+    assert overlay_b.globals["shared"] == "parent"
+
+    # Mutating overlay A must not affect parent or overlay B.
+    overlay_a.globals["shared"] = "a"
+    overlay_a.globals["tenant"] = "A"
+
+    assert env.globals["shared"] == "parent"
+    assert "tenant" not in env.globals
+    assert overlay_b.globals["shared"] == "parent"
+    assert "tenant" not in overlay_b.globals
+
+    # Mutating overlay B must not affect overlay A or parent.
+    overlay_b.globals["shared"] = "b"
+    overlay_b.globals["tenant"] = "B"
+
+    assert overlay_a.globals["shared"] == "a"
+    assert overlay_a.globals["tenant"] == "A"
+    assert env.globals["shared"] == "parent"
+    assert "tenant" not in env.globals
+
+
+def test_overlay_filters_isolation(env):
+    """Mutating an overlay's filters must not affect the parent."""
+    env.filters["my_filter"] = lambda x: f"parent:{x}"
+
+    overlay = env.overlay()
+    overlay.filters["my_filter"] = lambda x: f"overlay:{x}"
+    overlay.filters["extra"] = lambda x: x
+
+    # Parent still has original filter.
+    assert env.filters["my_filter"]("v") == "parent:v"
+    assert "extra" not in env.filters
+
+
+def test_overlay_tests_isolation(env):
+    """Mutating an overlay's tests must not affect the parent."""
+    env.tests["my_test"] = lambda x: False
+
+    overlay = env.overlay()
+    overlay.tests["my_test"] = lambda x: True
+    overlay.tests["extra"] = lambda x: True
+
+    assert env.tests["my_test"]("v") is False
+    assert "extra" not in env.tests
+
+
+def test_overlay_policies_isolation(env):
+    """Mutating an overlay's policies must not affect the parent."""
+    original = env.policies.copy()
+
+    overlay = env.overlay()
+    overlay.policies["some_key"] = "changed"
+
+    assert env.policies == original
+    assert "some_key" not in env.policies
+
+
+def test_overlay_template_cache_isolation(env):
+    """Each overlay must have its own template cache."""
+    loader_a = DictLoader({"t.html": "A:{{ tenant }}"})
+    loader_b = DictLoader({"t.html": "B:{{ tenant }}"})
+
+    overlay_a = env.overlay(loader=loader_a)
+    overlay_a.globals["tenant"] = "alpha"
+
+    overlay_b = env.overlay(loader=loader_b)
+    overlay_b.globals["tenant"] = "beta"
+
+    # Load and cache in overlay A.
+    result_a = overlay_a.get_template("t.html").render()
+    assert result_a == "A:alpha"
+
+    # Overlay B loads the same template name — must get its own version.
+    result_b = overlay_b.get_template("t.html").render()
+    assert result_b == "B:beta"
+
+    # Cached templates must still be correct after both are loaded.
+    assert overlay_a.get_template("t.html").render() == "A:alpha"
+    assert overlay_b.get_template("t.html").render() == "B:beta"
+
+    # The template objects must be distinct (different cache entries).
+    tmpl_a = overlay_a.get_template("t.html")
+    tmpl_b = overlay_b.get_template("t.html")
+    assert tmpl_a is not tmpl_b
+
+
+def test_overlay_multi_tenant_rendering(env):
+    """End-to-end multi-tenant rendering: two tenants with different
+    globals and loaders render the same template name correctly, both
+    before and after caching."""
+    templates = {
+        "page.html": "tenant={{ tenant_id }}, data={{ data }}",
+    }
+
+    overlay_a = env.overlay(loader=DictLoader(templates))
+    overlay_a.globals["tenant_id"] = "A"
+    overlay_a.globals["data"] = "alpha-data"
+
+    overlay_b = env.overlay(loader=DictLoader(templates))
+    overlay_b.globals["tenant_id"] = "B"
+    overlay_b.globals["data"] = "beta-data"
+
+    # First render (cache miss).
+    assert overlay_a.get_template("page.html").render() == "tenant=A, data=alpha-data"
+    assert overlay_b.get_template("page.html").render() == "tenant=B, data=beta-data"
+
+    # Second render (cache hit) — must still be correct.
+    assert overlay_a.get_template("page.html").render() == "tenant=A, data=alpha-data"
+    assert overlay_b.get_template("page.html").render() == "tenant=B, data=beta-data"
+
+    # Interleaved access pattern (simulates tenant switching).
+    for _ in range(5):
+        assert overlay_b.get_template("page.html").render() == "tenant=B, data=beta-data"
+        assert overlay_a.get_template("page.html").render() == "tenant=A, data=alpha-data"
+
+
+def test_overlay_multi_tenant_include(env):
+    """``{% include %}`` must resolve within the correct overlay's
+    loader and globals."""
+    loader_a = DictLoader({
+        "page.html": "{% include 'header.html' %}body-A",
+        "header.html": "[header-{{ tenant_id }}]",
+    })
+    loader_b = DictLoader({
+        "page.html": "{% include 'header.html' %}body-B",
+        "header.html": "[header-{{ tenant_id }}]",
+    })
+
+    overlay_a = env.overlay(loader=loader_a)
+    overlay_a.globals["tenant_id"] = "A"
+
+    overlay_b = env.overlay(loader=loader_b)
+    overlay_b.globals["tenant_id"] = "B"
+
+    assert overlay_a.get_template("page.html").render() == "[header-A]body-A"
+    assert overlay_b.get_template("page.html").render() == "[header-B]body-B"
+
+    # Cache hit — must still be correct.
+    assert overlay_a.get_template("page.html").render() == "[header-A]body-A"
+    assert overlay_b.get_template("page.html").render() == "[header-B]body-B"
+
+
+def test_overlay_multi_tenant_import(env):
+    """``{% import %}`` must resolve within the correct overlay's
+    loader and globals."""
+    loader_a = DictLoader({
+        "page.html": '{% import "macros.html" as m %}{{ m.greet() }}',
+        "macros.html": "{% macro greet() %}hello-{{ tenant_id }}{% endmacro %}",
+    })
+    loader_b = DictLoader({
+        "page.html": '{% import "macros.html" as m %}{{ m.greet() }}',
+        "macros.html": "{% macro greet() %}hello-{{ tenant_id }}{% endmacro %}",
+    })
+
+    overlay_a = env.overlay(loader=loader_a)
+    overlay_a.globals["tenant_id"] = "A"
+
+    overlay_b = env.overlay(loader=loader_b)
+    overlay_b.globals["tenant_id"] = "B"
+
+    assert overlay_a.get_template("page.html").render() == "hello-A"
+    assert overlay_b.get_template("page.html").render() == "hello-B"
+
+    # Cache hit.
+    assert overlay_a.get_template("page.html").render() == "hello-A"
+    assert overlay_b.get_template("page.html").render() == "hello-B"
+
+
+def test_overlay_cache_hit_globals_stability(env):
+    """A cache hit in one overlay must not contaminate the globals
+    visible to a cached template in a sibling overlay."""
+    templates = {"t.html": "{{ secret }}"}
+
+    overlay_a = env.overlay(loader=DictLoader(templates))
+    overlay_a.globals["secret"] = "alpha-secret"
+
+    overlay_b = env.overlay(loader=DictLoader(templates))
+    overlay_b.globals["secret"] = "beta-secret"
+
+    # Load both templates (populates both caches).
+    assert overlay_a.get_template("t.html").render() == "alpha-secret"
+    assert overlay_b.get_template("t.html").render() == "beta-secret"
+
+    # Mutate overlay A's globals after B's template is cached.
+    overlay_a.globals["secret"] = "alpha-CHANGED"
+
+    # Overlay B's cached template must not see A's change.
+    assert overlay_b.get_template("t.html").render() == "beta-secret"
+
+
+def test_overlay_auto_reload_globals(env):
+    """With ``auto_reload=True``, templates reloaded in one overlay
+    must not carry another overlay's globals."""
+    import tempfile
+    import time
+
+    from jinja2 import FileSystemLoader
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpl_path = Path(tmpdir) / "t.html"
+        tmpl_path.write_text("v1:{{ tenant_id }}")
+
+        loader_a = FileSystemLoader(tmpdir)
+        loader_b = FileSystemLoader(tmpdir)
+
+        overlay_a = env.overlay(loader=loader_a, auto_reload=True)
+        overlay_a.globals["tenant_id"] = "A"
+
+        overlay_b = env.overlay(loader=loader_b, auto_reload=True)
+        overlay_b.globals["tenant_id"] = "B"
+
+        # Initial load.
+        assert overlay_a.get_template("t.html").render() == "v1:A"
+        assert overlay_b.get_template("t.html").render() == "v1:B"
+
+        # Modify the file to trigger auto_reload.
+        time.sleep(0.05)
+        tmpl_path.write_text("v2:{{ tenant_id }}")
+
+        # Both overlays should reload correctly.
+        assert overlay_a.get_template("t.html").render() == "v2:A"
+        assert overlay_b.get_template("t.html").render() == "v2:B"
