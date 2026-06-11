@@ -433,3 +433,159 @@ def test_overlay_enable_async(env):
     env_async = env.overlay(enable_async=True)
     assert env_async.is_async
     assert not env_async.overlay(enable_async=False).is_async
+
+
+class TestOverlayCacheIsolation:
+    """Regression tests for multi-tenant overlay environments.
+
+    Overlays must fully isolate globals, filters, loader resolution,
+    and template caches so that switching between overlay environments
+    (e.g. per-tenant) never leaks state.
+    """
+
+    def test_overlay_globals_isolated_from_parent(self):
+        base = Environment(loader=DictLoader({"t": "{{ x }}"}))
+        base.globals["x"] = "base"
+        child = base.overlay()
+        child.globals["x"] = "child"
+        assert base.globals["x"] == "base"
+
+    def test_overlay_globals_isolated_between_siblings(self):
+        base = Environment(loader=DictLoader({"t": "{{ x }}"}))
+        base.globals["x"] = "base"
+        a = base.overlay()
+        a.globals["x"] = "A"
+        b = base.overlay()
+        b.globals["x"] = "B"
+        assert a.globals["x"] == "A"
+        assert b.globals["x"] == "B"
+        assert base.globals["x"] == "base"
+
+    def test_overlay_filters_isolated(self):
+        base = Environment()
+        a = base.overlay()
+        a.filters["tenant_filter"] = lambda v: f"A:{v}"
+        b = base.overlay()
+        assert "tenant_filter" not in b.filters
+        assert "tenant_filter" not in base.filters
+
+    def test_overlay_tests_isolated(self):
+        base = Environment()
+        a = base.overlay()
+        a.tests["is_tenant_a"] = lambda v: v == "A"
+        b = base.overlay()
+        assert "is_tenant_a" not in b.tests
+        assert "is_tenant_a" not in base.tests
+
+    def test_overlay_policies_isolated(self):
+        base = Environment()
+        a = base.overlay()
+        a.policies["my_policy"] = True
+        b = base.overlay()
+        assert "my_policy" not in b.policies
+        assert "my_policy" not in base.policies
+
+    def test_overlay_template_renders_own_globals(self):
+        loader = DictLoader({"t": "{{ tenant }}"})
+        base = Environment(loader=loader)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        assert a.get_template("t").render() == "A"
+        assert b.get_template("t").render() == "B"
+
+    def test_overlay_cache_does_not_leak_globals(self):
+        loader = DictLoader({"t": "{{ tenant }}"})
+        base = Environment(loader=loader)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        # Load in A, then in B — B must not see A's value.
+        assert a.get_template("t").render() == "A"
+        assert b.get_template("t").render() == "B"
+        # Load again in A — must still be A.
+        assert a.get_template("t").render() == "A"
+
+    def test_per_call_globals_do_not_persist_in_cache(self):
+        env = Environment(loader=DictLoader({"t": "{{ x }}"}))
+        env.globals["x"] = "default"
+        t1 = env.get_template("t", globals={"x": "custom"})
+        assert t1.render() == "custom"
+        t2 = env.get_template("t")
+        assert t2.render() == "default"
+
+    def test_per_call_globals_no_stale_keys(self):
+        env = Environment(loader=DictLoader({"t": "{{ x }}|{{ y }}"}))
+        env.globals["x"] = "ex"
+        env.globals["y"] = "ey"
+        env.get_template("t", globals={"x": "override", "y": "extra"})
+        t = env.get_template("t", globals={"x": "only_x"})
+        assert t.render() == "only_x|ey"
+
+    def test_include_uses_overlay_globals(self):
+        loader = DictLoader({
+            "main": "{% include 'partial' %}",
+            "partial": "{{ tenant }}",
+        })
+        base = Environment(loader=loader)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        assert a.get_template("main").render() == "A"
+        assert b.get_template("main").render() == "B"
+
+    def test_import_uses_overlay_globals(self):
+        loader = DictLoader({
+            "main": "{% import 'macros' as m %}{{ m.greet() }}",
+            "macros": "{% macro greet() %}Hello {{ tenant }}{% endmacro %}",
+        })
+        base = Environment(loader=loader)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        assert a.get_template("main").render() == "Hello A"
+        assert b.get_template("main").render() == "Hello B"
+
+    def test_from_import_uses_overlay_globals(self):
+        loader = DictLoader({
+            "main": "{% from 'macros' import greet %}{{ greet() }}",
+            "macros": "{% macro greet() %}Hi {{ tenant }}{% endmacro %}",
+        })
+        base = Environment(loader=loader)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        assert a.get_template("main").render() == "Hi A"
+        assert b.get_template("main").render() == "Hi B"
+
+    def test_overlay_with_different_loader(self):
+        base = Environment(loader=DictLoader({"t": "base"}))
+        child = base.overlay(loader=DictLoader({"t": "child"}))
+        assert base.get_template("t").render() == "base"
+        assert child.get_template("t").render() == "child"
+
+    def test_cache_hit_reuses_compiled_code(self):
+        env = Environment(loader=DictLoader({"t": "{{ x }}"}))
+        env.globals["x"] = "v1"
+        t1 = env.get_template("t")
+        t2 = env.get_template("t")
+        assert t1.root_render_func is t2.root_render_func
+
+    def test_auto_reload_overlay_globals_correct(self):
+        src = {"t": "{{ tenant }}"}
+        loader = DictLoader(src)
+        base = Environment(loader=loader, auto_reload=True)
+        a = base.overlay()
+        a.globals["tenant"] = "A"
+        b = base.overlay()
+        b.globals["tenant"] = "B"
+        assert a.get_template("t").render() == "A"
+        # Simulate source change — DictLoader's uptodate checks mapping.
+        src["t"] = "v2:{{ tenant }}"
+        assert b.get_template("t").render().endswith("B")
+        assert a.get_template("t").render().endswith("A")

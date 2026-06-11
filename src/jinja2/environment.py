@@ -435,6 +435,14 @@ class Environment:
         rv.overlayed = True
         rv.linked_to = self
 
+        # Prevent the overlay from sharing mutable mappings with the
+        # parent so that per-overlay changes (e.g. tenant globals) stay
+        # isolated.
+        rv.globals = self.globals.copy()
+        rv.filters = self.filters.copy()
+        rv.tests = self.tests.copy()
+        rv.policies = self.policies.copy()
+
         for key, value in args.items():
             if value is not missing:
                 setattr(rv, key, value)
@@ -964,10 +972,13 @@ class Environment:
             if template is not None and (
                 not self.auto_reload or template.is_up_to_date
             ):
-                # template.globals is a ChainMap, modifying it will only
-                # affect the template, not the environment globals.
-                if globals:
-                    template.globals.update(globals)
+                # Rebuild the globals ChainMap so that (a) per-call
+                # globals don't accumulate stale keys across loads and
+                # (b) the environment globals layer always points at
+                # *this* environment's dict, not the one from an earlier
+                # overlay that first populated the cache.
+                template.globals = self.make_globals(globals)
+                template._module = None
 
                 return template
 

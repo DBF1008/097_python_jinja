@@ -723,12 +723,13 @@ End"""
         tmpl = env.get_template("base", globals={"x": 42})
         assert tmpl.render() == "42 y"
 
-        # templates are cached, they keep template globals set earlier
+        # Without per-call globals the template falls back to env globals;
+        # previously set per-call globals do NOT persist in the cache.
         tmpl = env.get_template("main")
-        assert tmpl.render() == "bar y"
+        assert tmpl.render() == "x y"
 
         tmpl = env.get_template("base")
-        assert tmpl.render() == "42 y"
+        assert tmpl.render() == "x y"
 
     def test_nested_loop_scoping(self, env):
         tmpl = env.from_string(
